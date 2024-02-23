@@ -2,150 +2,143 @@
 
 use crate::{
     common::{Gid, Uid},
-    User, UserInner,
+    Group,
 };
 
-use libc::{c_char, endpwent, getpwent, setpwent, strlen};
-use std::collections::HashMap;
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+use crate::User;
 
-fn endswith(s1: *const c_char, s2: &[u8]) -> bool {
-    if s1.is_null() {
-        return false;
-    }
-    unsafe {
-        let mut len = strlen(s1) as isize - 1;
-        let mut i = s2.len() as isize - 1;
-        while len >= 0 && i >= 0 && *s1.offset(len) == s2[i as usize] as _ {
-            i -= 1;
-            len -= 1;
+use libc::{getgrgid_r, getgrouplist};
+
+pub(crate) struct UserInner {
+    pub(crate) uid: Uid,
+    pub(crate) gid: Gid,
+    pub(crate) name: String,
+    c_user: Vec<u8>,
+}
+
+impl UserInner {
+    pub(crate) fn new(uid: Uid, gid: Gid, name: String) -> Self {
+        let mut c_user = name.as_bytes().to_vec();
+        c_user.push(0);
+        Self {
+            uid,
+            gid,
+            name,
+            c_user,
         }
-        i == -1
+    }
+
+    pub(crate) fn id(&self) -> &Uid {
+        &self.uid
+    }
+
+    pub(crate) fn group_id(&self) -> Gid {
+        self.gid
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn groups(&self) -> Vec<Group> {
+        unsafe { get_user_groups(self.c_user.as_ptr() as *const _, self.gid.0 as _) }
     }
 }
 
+pub(crate) unsafe fn get_group_name(
+    id: libc::gid_t,
+    buffer: &mut Vec<libc::c_char>,
+) -> Option<String> {
+    let mut g = std::mem::MaybeUninit::<libc::group>::uninit();
+    let mut tmp_ptr = std::ptr::null_mut();
+    let mut last_errno = 0;
+    loop {
+        if retry_eintr!(set_to_0 => last_errno => getgrgid_r(
+            id as _,
+            g.as_mut_ptr() as _,
+            buffer.as_mut_ptr(),
+            buffer.capacity() as _,
+            &mut tmp_ptr as _
+        )) != 0
+        {
+            // If there was not enough memory, we give it more.
+            if last_errno == libc::ERANGE as _ {
+                buffer.reserve(2048);
+                continue;
+            }
+            return None;
+        }
+        break;
+    }
+    let g = g.assume_init();
+    super::utils::cstr_to_rust(g.gr_name)
+}
+
+pub(crate) unsafe fn get_user_groups(
+    name: *const libc::c_char,
+    group_id: libc::gid_t,
+) -> Vec<Group> {
+    let mut buffer = Vec::with_capacity(2048);
+    let mut groups = Vec::with_capacity(256);
+
+    loop {
+        let mut nb_groups = groups.capacity();
+        if getgrouplist(
+            name,
+            group_id as _,
+            groups.as_mut_ptr(),
+            &mut nb_groups as *mut _ as *mut _,
+        ) == -1
+        {
+            groups.reserve(256);
+            continue;
+        }
+        groups.set_len(nb_groups as _);
+        return groups
+            .iter()
+            .filter_map(|group_id| {
+                let name = get_group_name(*group_id as _, &mut buffer)?;
+                Some(Group {
+                    name,
+                    id: Gid(*group_id as _),
+                })
+            })
+            .collect();
+    }
+}
+
+// Not used by mac.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub(crate) fn get_users(users: &mut Vec<User>) {
-    fn filter(shell: *const c_char, uid: u32) -> bool {
-        !endswith(shell, b"/false") && !endswith(shell, b"/uucico") && uid < 65536
+    use std::fs::File;
+    use std::io::Read;
+
+    #[inline]
+    fn parse_id(id: &str) -> Option<u32> {
+        id.parse::<u32>().ok()
     }
 
     users.clear();
 
-    let mut users_map = HashMap::with_capacity(10);
+    let mut s = String::new();
 
-    unsafe {
-        setpwent();
-        loop {
-            let pw = getpwent();
-            if pw.is_null() {
-                // The call was interrupted by a signal, retrying.
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+    let _ = File::open("/etc/passwd").and_then(|mut f| f.read_to_string(&mut s));
+    for line in s.lines() {
+        let mut parts = line.split(':');
+        if let Some(username) = parts.next() {
+            let mut parts = parts.skip(1);
+            // Skip the user if the uid cannot be parsed correctly
+            if let Some(uid) = parts.next().and_then(parse_id) {
+                if let Some(group_id) = parts.next().and_then(parse_id) {
+                    users.push(User {
+                        inner: UserInner::new(Uid(uid), Gid(group_id), username.to_owned()),
+                    });
                 }
-                break;
-            }
-
-            if !filter((*pw).pw_shell, (*pw).pw_uid) {
-                // This is not a "real" or "local" user.
-                continue;
-            }
-            if let Some(name) = crate::unix::utils::cstr_to_rust((*pw).pw_name) {
-                if users_map.contains_key(&name) {
-                    continue;
-                }
-
-                let uid = (*pw).pw_uid;
-                let gid = (*pw).pw_gid;
-                users_map.insert(name, (Uid(uid), Gid(gid)));
             }
         }
-        endpwent();
-    }
-    for (name, (uid, gid)) in users_map {
-        users.push(User {
-            inner: UserInner::new(uid, gid, name),
-        });
     }
 }
 
-// This was the OSX-based solution. It provides enough information, but what a mess!
-// pub fn get_users_list() -> Vec<User> {
-//     let mut users = Vec::new();
-//     let node_name = b"/Local/Default\0";
-
-//     unsafe {
-//         let node_name = ffi::CFStringCreateWithCStringNoCopy(
-//             std::ptr::null_mut(),
-//             node_name.as_ptr() as *const c_char,
-//             ffi::kCFStringEncodingMacRoman,
-//             ffi::kCFAllocatorNull as *mut c_void,
-//         );
-//         let node_ref = ffi::ODNodeCreateWithName(
-//             ffi::kCFAllocatorDefault,
-//             ffi::kODSessionDefault,
-//             node_name,
-//             std::ptr::null_mut(),
-//         );
-//         let query = ffi::ODQueryCreateWithNode(
-//             ffi::kCFAllocatorDefault,
-//             node_ref,
-//             ffi::kODRecordTypeUsers as _, // kODRecordTypeGroups
-//             std::ptr::null(),
-//             0,
-//             std::ptr::null(),
-//             std::ptr::null(),
-//             0,
-//             std::ptr::null_mut(),
-//         );
-//         if query.is_null() {
-//             return users;
-//         }
-//         let results = ffi::ODQueryCopyResults(
-//             query,
-//             false as _,
-//             std::ptr::null_mut(),
-//         );
-//         let len = ffi::CFArrayGetCount(results);
-//         for i in 0..len {
-//             let name = match get_user_name(ffi::CFArrayGetValueAtIndex(results, i)) {
-//                 Some(n) => n,
-//                 None => continue,
-//             };
-//             users.push(User { name });
-//         }
-
-//         ffi::CFRelease(results as *const c_void);
-//         ffi::CFRelease(query as *const c_void);
-//         ffi::CFRelease(node_ref as *const c_void);
-//         ffi::CFRelease(node_name as *const c_void);
-//     }
-//     users.sort_unstable_by(|x, y| x.name.partial_cmp(&y.name).unwrap());
-//     return users;
-// }
-
-// fn get_user_name(result: *const c_void) -> Option<String> {
-//     let user_name = ffi::ODRecordGetRecordName(result as _);
-//     let ptr = ffi::CFStringGetCharactersPtr(user_name);
-//     String::from_utf16(&if ptr.is_null() {
-//         let len = ffi::CFStringGetLength(user_name); // It returns the len in UTF-16 code pairs.
-//         if len == 0 {
-//             continue;
-//         }
-//         let mut v = Vec::with_capacity(len as _);
-//         for x in 0..len {
-//             v.push(ffi::CFStringGetCharacterAtIndex(user_name, x));
-//         }
-//         v
-//     } else {
-//         let mut v: Vec<u16> = Vec::new();
-//         let mut x = 0;
-//         loop {
-//             let letter = *ptr.offset(x);
-//             if letter == 0 {
-//                 break;
-//             }
-//             v.push(letter);
-//             x += 1;
-//         }
-//         v
-//     }.ok()
-// }
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) use crate::unix::apple::users::get_users;

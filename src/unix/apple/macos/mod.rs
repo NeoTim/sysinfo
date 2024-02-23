@@ -1,13 +1,23 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(crate) mod x86;
+pub mod disk;
+pub mod ffi;
+pub(crate) mod utils;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(crate) use self::x86::*;
+#[cfg(not(feature = "apple-sandbox"))]
+pub(crate) mod cpu;
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) mod arm;
+#[cfg(not(feature = "apple-sandbox"))]
+pub mod system;
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) use self::arm::*;
+#[cfg(not(feature = "apple-sandbox"))]
+pub mod component;
+
+#[cfg(not(feature = "apple-sandbox"))]
+pub mod process;
+
+#[cfg(feature = "apple-sandbox")]
+pub use crate::sys::app_store::component;
+
+#[cfg(feature = "apple-sandbox")]
+pub use crate::sys::app_store::process;
